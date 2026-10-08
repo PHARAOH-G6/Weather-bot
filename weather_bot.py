@@ -1,13 +1,19 @@
 import asyncio
 import os
+import re
 import requests
 from datetime import datetime
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats,
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType
@@ -15,68 +21,473 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 
 # ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # ← Важно: токен берём из переменных окружения Render
+# Токен берём из переменных окружения Render (Environment → BOT_TOKEN)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# --- НОВЫЕ НАСТРОЙКИ ДЛЯ WEBHOOKS ---
-# Render автоматически подставит свой домен в переменную RENDER_EXTERNAL_URL
+# Render автоматически подставит свой домен в RENDER_EXTERNAL_URL
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:10000")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 # Порт, который слушает Render
 PORT = int(os.getenv("PORT", 10000))
-# ------------------------------------
 
+# Триггер-слова для работы в группах
 TRIGGER_WORDS = ["погода", "weather", "погодка"]
 ADDRESS_WORDS = ["бот", "bot"]
 
+# Популярные города для inline-кнопок
 POPULAR_CITIES = {
-    "Минск": "🇧🇾", "Москва": "🇷🇺", "Санкт-Петербург": "🇷🇺", "Киев": "🇺🇦",
-    "Варшава": "🇵🇱", "Берлин": "🇩🇪", "Лондон": "🇬🇧", "Париж": "🇫🇷",
-    "Нью-Йорк": "🇺🇸", "Токио": "🇯🇵",
+    "Минск": "🇧🇾",
+    "Москва": "🇷🇺",
+    "Санкт-Петербург": "🇷🇺",
+    "Киев": "🇺🇦",
+    "Варшава": "🇵🇱",
+    "Берлин": "🇩🇪",
+    "Лондон": "🇬🇧",
+    "Париж": "🇫🇷",
+    "Нью-Йорк": "🇺🇸",
+    "Токио": "🇯🇵",
 }
 
-GROUP_SETTINGS = {"delete_trigger_message": False, "reply_to_user": True}
+GROUP_SETTINGS = {
+    "delete_trigger_message": False,
+    "reply_to_user": True,
+}
 
 # ==================== ИНИЦИАЛИЗАЦИЯ ====================
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 chat_last_city: dict[int, str] = {}
 
-# ... (Здесь идут все ваши функции API, парсинга, клавиатур, форматирования и хендлеры без изменений) ...
-# Скопируйте их сюда из предыдущего кода.
+
+# ==================== API ====================
+def get_coordinates(city_name: str):
+    url = "https://geocoding-api.open-meteo.com/v1/search"
+    params = {"name": city_name, "count": 1, "language": "ru", "format": "json"}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if "results" in data and data["results"]:
+            res = data["results"][0]
+            return res["latitude"], res["longitude"], res.get("name", city_name)
+    except Exception:
+        pass
+    return None, None, None
+
+
+def get_weather(lat: float, lon: float):
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                   "weather_code,wind_speed_10m,pressure_msl",
+        "daily": "temperature_2m_max,temperature_2m_min,"
+                 "precipitation_probability_max,sunrise,sunset",
+        "timezone": "auto",
+        "forecast_days": 1,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def decode_weather_code(code: int):
+    codes = {
+        0: ("Ясно", "☀️"), 1: ("Преимущественно ясно", "🌤"),
+        2: ("Переменная облачность", "⛅"), 3: ("Пасмурно", "☁️"),
+        45: ("Туман", "🌫"), 48: ("Оседающий туман", "🌫"),
+        51: ("Лёгкая морось", "🌦"), 53: ("Умеренная морось", "🌦"),
+        55: ("Плотная морось", "🌦"),
+        61: ("Небольшой дождь", "🌧"), 63: ("Умеренный дождь", "🌧"),
+        65: ("Сильный дождь", "🌧"),
+        71: ("Небольшой снег", "🌨"), 73: ("Умеренный снег", "🌨"),
+        75: ("Сильный снег", "🌨"), 77: ("Снежная крупа", "🌨"),
+        80: ("Ливень", "🌧"), 81: ("Сильный ливень", "🌧"),
+        82: ("Очень сильный ливень", "⛈"),
+        85: ("Снежный ливень", "🌨"), 86: ("Сильный снежный ливень", "🌨"),
+        95: ("Гроза", "⛈"), 96: ("Гроза с градом", "⛈"),
+        99: ("Сильная гроза с градом", "⛈"),
+    }
+    return codes.get(code, ("Неизвестно", "❓"))
+
+
+# ==================== ПАРСИНГ СООБЩЕНИЙ ====================
+def extract_city_from_text(text: str, bot_username: str) -> str | None:
+    """Извлекает город из текста, если есть триггер или упоминание бота."""
+    if not text:
+        return None
+
+    original = text.strip()
+    lowered = original.lower()
+
+    cleaned = re.sub(rf"@{re.escape(bot_username)}\b", "", original, flags=re.IGNORECASE).strip()
+
+    starts_with_trigger = any(cleaned.lower().startswith(tw) for tw in TRIGGER_WORDS)
+    starts_with_address = any(cleaned.lower().startswith(aw) for aw in ADDRESS_WORDS)
+    mentioned_bot = f"@{bot_username.lower()}" in lowered
+
+    if not (starts_with_trigger or starts_with_address or mentioned_bot):
+        return None
+
+    for word in TRIGGER_WORDS + ADDRESS_WORDS:
+        cleaned = re.sub(
+            rf"^{re.escape(word)}[\s,:!?-]*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    cleaned = cleaned.strip(" ?!.,:;")
+
+    if not cleaned or len(cleaned) > 60:
+        return None
+
+    return cleaned
+
+
+# ==================== КЛАВИАТУРЫ ====================
+def main_menu_kb() -> InlineKeyboardMarkup:
+    rows = []
+    cities = list(POPULAR_CITIES.items())
+    for i in range(0, len(cities), 2):
+        row = [
+            InlineKeyboardButton(text=f"{flag} {city}", callback_data=f"city:{city}")
+            for city, flag in cities[i:i + 2]
+        ]
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(text="✏️ Ввести город вручную", callback_data="manual"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def city_actions_kb(city: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh:{city}"),
+            InlineKeyboardButton(text="📅 Прогноз", callback_data=f"daily:{city}"),
+        ],
+        [
+            InlineKeyboardButton(text="🏙 Сменить город", callback_data="back_to_menu"),
+        ],
+    ])
+
+
+def back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_menu")],
+    ])
+
+
+# ==================== ФОРМАТИРОВАНИЕ ====================
+def format_current_weather(city: str, data: dict, is_group: bool = False) -> str:
+    cur = data["current"]
+    desc, emoji = decode_weather_code(cur["weather_code"])
+
+    return (
+        f"<b>{emoji} Погода в {city}</b>\n"
+        f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌡 <b>Температура:</b> {cur['temperature_2m']}°C\n"
+        f"🤔 <b>Ощущается:</b> {cur['apparent_temperature']}°C\n"
+        f"{emoji} <b>Состояние:</b> {desc}\n"
+        f"💧 <b>Влажность:</b> {cur['relative_humidity_2m']}%\n"
+        f"🌬 <b>Ветер:</b> {cur['wind_speed_10m']} км/ч\n"
+        f"📊 <b>Давление:</b> {round(cur['pressure_msl'] * 0.750064)} мм рт. ст."
+    )
+
+
+def format_daily_forecast(city: str, data: dict) -> str:
+    d = data["daily"]
+    return (
+        f"<b>📅 Прогноз на сегодня — {city}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔺 <b>Максимум:</b> {d['temperature_2m_max'][0]}°C\n"
+        f"🔻 <b>Минимум:</b> {d['temperature_2m_min'][0]}°C\n"
+        f"☔ <b>Осадки:</b> {d['precipitation_probability_max'][0]}%\n"
+        f"🌅 <b>Восход:</b> {d['sunrise'][0].split('T')[1]}\n"
+        f"🌇 <b>Закат:</b> {d['sunset'][0].split('T')[1]}"
+    )
+
+
+# ==================== ОБЩАЯ ФУНКЦИЯ ОТВЕТА ====================
+async def send_weather(
+    message: Message,
+    city: str,
+    is_group: bool = False,
+    reply_to: Message | None = None,
+):
+    lat, lon, resolved = get_coordinates(city)
+    if lat is None:
+        text = f"❌ Город «{city}» не найден."
+        kb = main_menu_kb() if not is_group else None
+        kwargs = {}
+        if is_group and reply_to and GROUP_SETTINGS["reply_to_user"]:
+            kwargs["reply_to_message_id"] = reply_to.message_id
+        await message.answer(text, reply_markup=kb, **kwargs)
+        return
+
+    data = get_weather(lat, lon)
+    if not data:
+        await message.answer("❌ Не удалось получить данные о погоде.")
+        return
+
+    chat_last_city[message.chat.id] = resolved
+    kb = city_actions_kb(resolved) if not is_group else None
+
+    kwargs = {}
+    if is_group and reply_to and GROUP_SETTINGS["reply_to_user"]:
+        kwargs["reply_to_message_id"] = reply_to.message_id
+
+    await message.answer(
+        format_current_weather(resolved, data, is_group),
+        reply_markup=kb,
+        **kwargs,
+    )
+
+
+async def show_weather_edit(message: Message, city: str):
+    lat, lon, resolved = get_coordinates(city)
+    if lat is None:
+        await message.edit_text(f"❌ Город «{city}» не найден.", reply_markup=back_kb())
+        return
+    data = get_weather(lat, lon)
+    if not data:
+        await message.edit_text("❌ Не удалось получить погоду.", reply_markup=back_kb())
+        return
+    await message.edit_text(
+        format_current_weather(resolved, data),
+        reply_markup=city_actions_kb(resolved),
+    )
+
+
+# ==================== КОМАНДЫ ====================
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+
+    if is_group:
+        text = (
+            "👋 <b>Привет!</b>\n\n"
+            "Чтобы узнать погоду, напиши:\n"
+            "• <code>погода Минск</code>\n"
+            "• <code>@имя_бота погода Москва</code>\n"
+            "• или ответь на моё сообщение\n\n"
+            "Команды: /weather, /help"
+        )
+    else:
+        text = (
+            "👋 <b>Привет! Я бот погоды.</b>\n\n"
+            "Выбери город из списка ниже или отправь его название в чат."
+        )
+
+    await message.answer(text, reply_markup=main_menu_kb() if not is_group else None)
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+
+    if is_group:
+        text = (
+            "ℹ️ <b>Как пользоваться ботом в группе</b>\n\n"
+            "<b>Способы запросить погоду:</b>\n"
+            "• <code>погода Минск</code>\n"
+            "• <code>weather London</code>\n"
+            "• <code>@имя_бота погода Париж</code>\n"
+            "• ответом (reply) на моё сообщение\n\n"
+            "<b>Команды:</b>\n"
+            "• /weather <i>город</i> — погода\n"
+            "• /weather — повторить последний город\n"
+            "• /help — эта справка"
+        )
+    else:
+        text = (
+            "ℹ️ <b>Как пользоваться ботом</b>\n\n"
+            "• Нажми на кнопку с городом\n"
+            "• Или напиши название города вручную\n"
+            "• В группе: <code>погода Минск</code>"
+        )
+
+    await message.answer(text)
+
+
+@dp.message(Command("weather"))
+async def cmd_weather(message: Message):
+    is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    args = message.text.split(maxsplit=1)
+
+    if len(args) > 1:
+        city = args[1].strip()
+    else:
+        city = chat_last_city.get(message.chat.id)
+        if not city:
+            await message.answer("📍 Укажи город: <code>/weather Минск</code>")
+            return
+
+    await send_weather(
+        message,
+        city,
+        is_group=is_group,
+        reply_to=message if is_group else None,
+    )
+
+
+# ==================== INLINE-КНОПКИ ====================
+@dp.callback_query(F.data == "back_to_menu")
+async def cb_back_to_menu(callback: CallbackQuery):
+    is_group = callback.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    if is_group:
+        await callback.answer("Меню доступно только в личке с ботом", show_alert=True)
+        return
+    await callback.message.edit_text("🏙 <b>Выбери город:</b>", reply_markup=main_menu_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "manual")
+async def cb_manual(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "✏️ <b>Напиши название города в чат</b>\n"
+        "Например: <code>Гомель</code> или <code>New York</code>",
+        reply_markup=back_kb(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("city:"))
+async def cb_city(callback: CallbackQuery):
+    city = callback.data.split(":", 1)[1]
+    await show_weather_edit(callback.message, city)
+    chat_last_city[callback.message.chat.id] = city
+    await callback.answer(f"Погода: {city}")
+
+
+@dp.callback_query(F.data.startswith("refresh:"))
+async def cb_refresh(callback: CallbackQuery):
+    city = callback.data.split(":", 1)[1]
+    await show_weather_edit(callback.message, city)
+    await callback.answer("🔄 Обновлено")
+
+
+@dp.callback_query(F.data.startswith("daily:"))
+async def cb_daily(callback: CallbackQuery):
+    city = callback.data.split(":", 1)[1]
+    lat, lon, resolved = get_coordinates(city)
+    if lat is None:
+        await callback.answer("Город не найден", show_alert=True)
+        return
+    data = get_weather(lat, lon)
+    if not data or "daily" not in data:
+        await callback.answer("Не удалось получить прогноз", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        format_daily_forecast(resolved, data),
+        reply_markup=city_actions_kb(city),
+    )
+    await callback.answer()
+
 
 # ==================== ГЛАВНЫЙ ХЕНДЛЕР ТЕКСТА ====================
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text(message: Message):
-    # ... (Логика обработки текста без изменений)
-    pass
+    is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    bot_username = (await bot.me()).username
+
+    if is_group:
+        city = extract_city_from_text(message.text, bot_username)
+
+        if city is None and message.reply_to_message:
+            if message.reply_to_message.from_user.id == bot.id:
+                city = message.text.strip() or chat_last_city.get(message.chat.id)
+
+        if city is None:
+            return
+
+        await send_weather(message, city, is_group=True, reply_to=message)
+    else:
+        city = message.text.strip()
+        if not city:
+            return
+
+        wait = await message.answer(f"🔍 Ищу погоду для «{city}»...")
+        lat, lon, resolved = get_coordinates(city)
+        if lat is None:
+            await wait.edit_text(
+                f"❌ Город «{city}» не найден.\nПопробуй другое название.",
+                reply_markup=back_kb(),
+            )
+            return
+        data = get_weather(lat, lon)
+        if not data:
+            await wait.edit_text("❌ Не удалось получить данные.")
+            return
+
+        chat_last_city[message.chat.id] = resolved
+        await wait.edit_text(
+            format_current_weather(resolved, data),
+            reply_markup=city_actions_kb(resolved),
+        )
+
 
 # ==================== ГЕОЛОКАЦИЯ ====================
 @dp.message(F.location)
 async def handle_location(message: Message):
-    # ... (Логика обработки геолокации без изменений)
-    pass
+    is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    lat = message.location.latitude
+    lon = message.location.longitude
+    data = get_weather(lat, lon)
+    if not data:
+        await message.answer("❌ Не удалось получить погоду по геолокации.")
+        return
 
-# ==================== ЗАПУСК ====================
+    await message.answer(
+        format_current_weather("Ваше местоположение", data, is_group),
+        reply_markup=city_actions_kb("Ваше местоположение") if not is_group else None,
+    )
+
+
+# ==================== WEBHOOKS И ЗАПУСК ====================
 async def on_startup(bot: Bot):
-    """Устанавливаем вебхук при старте."""
     await bot.set_webhook(WEBHOOK_URL)
     print(f"✅ Webhook установлен: {WEBHOOK_URL}")
 
-async def main():
-    # Привязываем функцию к старту
-    dp.startup.register(on_startup)
 
-    # Создаём веб-приложение aiohttp
+async def set_commands():
+    private_commands = [
+        BotCommand(command="start", description="🏠 Главное меню"),
+        BotCommand(command="weather", description="🌤 Погода (можно: /weather Минск)"),
+        BotCommand(command="help", description="ℹ️ Помощь"),
+    ]
+    group_commands = [
+        BotCommand(command="weather", description="🌤 Погода: /weather Минск"),
+        BotCommand(command="help", description="ℹ️ Как пользоваться ботом"),
+    ]
+    await bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
+    await bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
+
+
+async def main():
+    dp.startup.register(on_startup)
+    await set_commands()
+
     app = web.Application()
     webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 
-    # Запускаем сервер на порту, который даёт Render
-    print(f"🚀 Запускаю веб-сервер на порту {PORT}...")
-    await web.run_app(app, host="0.0.0.0", port=PORT)
+    return app
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    print(f"🚀 Запускаю веб-сервер на порту {PORT}...")
+    web.run_app(main(), host="0.0.0.0", port=PORT)
