@@ -29,20 +29,34 @@ WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 PORT = int(os.getenv("PORT", 10000))
 
-# Триггер-слова — ищутся только в начале сообщения
+# Триггер-слова — ищутся в ЛЮБОМ месте сообщения
 TRIGGER_WORDS = [
-    "погода", "погодка", "погоду", "погоде", "погоды",
+    "погода", "погодка", "погоду", "погоде", "погоды", "погодой",
     "метео", "метеосводка",
     "weather",
     "прогноз",
     "температура",
 ]
 
-# Предлоги, которые могут стоять между триггером и городом
-LINK_WORDS = [
-    "в", "во", "на", "для", "по", "о", "об", "про",
-    "for", "in", "at",
-]
+# Слова-мусор, которые точно не являются городом
+SKIP_WORDS = {
+    # предлоги и союзы
+    "в", "во", "на", "для", "по", "о", "об", "про", "с", "со", "из", "от", "до",
+    "и", "а", "но", "же", "ли", "бы", "не", "ни", "у", "к", "ко",
+    "for", "in", "at", "on", "the", "of", "to",
+    # вопросительные / вводные
+    "какая", "какой", "какое", "какие", "какую", "каком",
+    "покажи", "скажи", "подскажи", "узнай", "хочу", "можно", "надо",
+    "сегодня", "завтра", "вчера", "сейчас", "будет", "была", "был", "были",
+    "пожалуйста", "плиз", "please",
+    # сам триггер (на всякий случай)
+    "погода", "погодка", "погоду", "погоде", "погоды", "погодой",
+    "метео", "метеосводка", "weather", "прогноз", "температура",
+    # мусор
+    "ну", "что", "эту", "этот", "эта", "эти", "там", "тут", "где",
+    "ебашь", "ебал", "ебать", "блядскую", "блядь", "блять", "хуй", "хуя",
+    "пиздец", "пидорас", "пизда", "сука", "нах", "нахуй",
+}
 
 POPULAR_CITIES = {
     "Минск": "🇧🇾",
@@ -127,50 +141,88 @@ def decode_weather_code(code: int):
 
 
 # ==================== ПАРСИНГ ====================
-def extract_city_from_text(text: str, bot_username: str) -> str | None:
+def normalize_city(word: str) -> str:
+    """
+    Грубо отсекает падежные окончания, чтобы Open-Meteo легче нашёл город.
+    «Москве» → «Москв», «Минске» → «Минск», «Париже» → «Париж».
+    """
+    w = word.strip(" ?!.,:;()\"'—–-").lower()
+    if not w or len(w) < 2:
+        return ""
+
+    # Если уже именительный или неизвестный — оставим как есть
+    for suffix in ("ой", "ей", "е", "у", "ю", "а", "я", "ы", "и"):
+        if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+            return w[:-len(suffix)]
+    return w
+
+
+def extract_city_from_text(text: str, bot_username: str):
     """
     Возвращает:
-      - "Минск"  — триггер + город
-      - ""       — только триггер (без города) → показать меню
-      - None     — триггера нет → молчать
+      - строку с городом — если найден через API
+      - ""              — триггер есть, но города нет → показать меню
+      - None            — триггера нет вообще → молчать
     """
     if not text:
         return None
 
     original = text.strip()
 
-    # Убираем упоминание бота в начале
+    # Убираем упоминание бота
     cleaned = re.sub(
-        rf"^@{re.escape(bot_username)}\b[,:\s]*", "", original, flags=re.IGNORECASE
-    ).strip()
+        rf"@{re.escape(bot_username)}\b", " ", original, flags=re.IGNORECASE
+    )
 
-    # Ищем триггер в начале сообщения
-    trigger = None
-    for word in TRIGGER_WORDS:
-        pattern = rf"^{re.escape(word)}\w*\b[\s,:!?-]*"
-        if re.match(pattern, cleaned, flags=re.IGNORECASE):
-            trigger = word
-            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
-            break
-
-    if not trigger:
+    # Ищем триггер в любом месте
+    lowered = cleaned.lower()
+    trigger_found = any(word in lowered for word in TRIGGER_WORDS)
+    if not trigger_found:
         return None
 
-    # Убираем предлог
-    for link in LINK_WORDS:
+    # Убираем триггер-слова
+    for word in TRIGGER_WORDS:
         cleaned = re.sub(
-            rf"^{re.escape(link)}\s+", "", cleaned, flags=re.IGNORECASE
-        ).strip()
+            rf"\b{re.escape(word)}\w*\b", " ", cleaned, flags=re.IGNORECASE
+        )
 
-    cleaned = cleaned.strip(" ?!.,:;")
+    # Чистим пунктуацию
+    cleaned = re.sub(r"[?!.,:;()\"'—–\-]", " ", cleaned)
+    words = [w for w in cleaned.split() if w]
 
-    if not cleaned or len(cleaned) < 2 or len(cleaned) > 60:
-        return ""
+    # Собираем кандидатов: 3, 2, 1 слово
+    candidates = []
+    for size in (3, 2, 1):
+        for i in range(len(words) - size + 1):
+            phrase_words = words[i:i + size]
+            if any(w.lower() in SKIP_WORDS for w in phrase_words):
+                continue
+            candidates.append(" ".join(phrase_words))
 
-    if len(cleaned.split()) > 4:
-        return ""
+    # Добавляем варианты с нормализацией окончаний
+    extra = []
+    for c in candidates:
+        norm = " ".join(normalize_city(w) for w in c.split())
+        if norm and norm != c.lower():
+            extra.append(norm)
+    candidates.extend(extra)
 
-    return cleaned
+    # Убираем дубли, сохраняя порядок
+    seen = set()
+    unique_candidates = []
+    for c in candidates:
+        if c.lower() not in seen:
+            seen.add(c.lower())
+            unique_candidates.append(c)
+
+    # Проверяем через API
+    for candidate in unique_candidates:
+        lat, lon, resolved = get_coordinates(candidate)
+        if lat is not None and resolved:
+            return resolved
+
+    # Города нет — покажем меню
+    return ""
 
 
 # ==================== КЛАВИАТУРЫ ====================
@@ -320,7 +372,7 @@ async def cmd_help(message: Message):
     if is_group:
         text = (
             "ℹ️ <b>Как пользоваться ботом в группе</b>\n\n"
-            "<b>Способы запросить погоду:</b>\n"
+            "<b>Примеры:</b>\n"
             "• <code>погода Минск</code>\n"
             "• <code>погода в Москве</code>\n"
             "• <code>метео Париж</code>\n"
@@ -439,14 +491,15 @@ async def handle_text(message: Message):
                     await send_weather(message, last, is_group=True, reply_to=message)
                 return
 
-        # Нет триггера — молчим
+        # Триггера нет — молчим
         if result is None:
             return
 
-        # Только триггер (без города) — показываем меню
+        # Триггер есть, но город не найден — показываем меню
         if result == "":
             await message.answer(
-                "🏙 <b>Выбери город:</b>",
+                "🏙 <b>Выбери город:</b>\n"
+                "<i>Или напиши: погода Минск</i>",
                 reply_markup=main_menu_kb(),
                 reply_to_message_id=(
                     message.message_id if GROUP_SETTINGS["reply_to_user"] else None
@@ -458,7 +511,6 @@ async def handle_text(message: Message):
         await send_weather(message, result, is_group=True, reply_to=message)
 
     else:
-        # В личке — любое сообщение = название города
         city = message.text.strip()
         if not city:
             return
