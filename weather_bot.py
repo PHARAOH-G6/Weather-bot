@@ -29,24 +29,19 @@ WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 PORT = int(os.getenv("PORT", 10000))
 
-# Триггер-слова — ищутся в ЛЮБОМ месте сообщения
+# Триггер-слова — ищутся только в начале сообщения
 TRIGGER_WORDS = [
     "погода", "погодка", "погоду", "погоде", "погоды",
     "метео", "метеосводка",
     "weather",
     "прогноз",
     "температура",
-    "сколько градусов",
 ]
 
-# Стоп-слова — убираем из текста, чтобы найти название города
-STOP_WORDS = [
+# Предлоги, которые могут стоять между триггером и городом
+LINK_WORDS = [
     "в", "во", "на", "для", "по", "о", "об", "про",
-    "какая", "какой", "какое", "какие",
-    "покажи", "скажи", "подскажи", "узнай",
-    "сегодня", "завтра", "сейчас", "будет",
-    "for", "in", "the", "at",
-    "пожалуйста", "плиз",
+    "for", "in", "at",
 ]
 
 POPULAR_CITIES = {
@@ -63,7 +58,6 @@ POPULAR_CITIES = {
 }
 
 GROUP_SETTINGS = {
-    "delete_trigger_message": False,
     "reply_to_user": True,
 }
 
@@ -132,51 +126,48 @@ def decode_weather_code(code: int):
     return codes.get(code, ("Неизвестно", "❓"))
 
 
-# ==================== ПАРСИНГ СООБЩЕНИЙ ====================
+# ==================== ПАРСИНГ ====================
 def extract_city_from_text(text: str, bot_username: str) -> str | None:
     """
-    Извлекает город из текста.
-    Триггер-слово ищется в ЛЮБОМ месте сообщения.
     Возвращает:
-      - строку с городом — если триггер найден и город распознан
-      - "" (пустую строку) — если триггер есть, но город не указан
-      - None — если триггера нет вообще (бот молчит)
+      - "Минск"  — триггер + город
+      - ""       — только триггер (без города) → показать меню
+      - None     — триггера нет → молчать
     """
     if not text:
         return None
 
     original = text.strip()
-    lowered = original.lower()
 
-    mentioned_bot = f"@{bot_username.lower()}" in lowered
+    # Убираем упоминание бота в начале
+    cleaned = re.sub(
+        rf"^@{re.escape(bot_username)}\b[,:\s]*", "", original, flags=re.IGNORECASE
+    ).strip()
 
-    trigger_found = any(word in lowered for word in TRIGGER_WORDS)
+    # Ищем триггер в начале сообщения
+    trigger = None
+    for word in TRIGGER_WORDS:
+        pattern = rf"^{re.escape(word)}\w*\b[\s,:!?-]*"
+        if re.match(pattern, cleaned, flags=re.IGNORECASE):
+            trigger = word
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+            break
 
-    if not (trigger_found or mentioned_bot):
+    if not trigger:
         return None
 
-    # Убираем упоминание бота
-    cleaned = re.sub(
-        rf"@{re.escape(bot_username)}\b", "", original, flags=re.IGNORECASE
-    )
-
-    # Убираем триггер-слова
-    for word in TRIGGER_WORDS:
+    # Убираем предлог
+    for link in LINK_WORDS:
         cleaned = re.sub(
-            rf"\b{re.escape(word)}\w*\b", "", cleaned, flags=re.IGNORECASE
-        )
+            rf"^{re.escape(link)}\s+", "", cleaned, flags=re.IGNORECASE
+        ).strip()
 
-    # Убираем стоп-слова
-    for word in STOP_WORDS:
-        cleaned = re.sub(
-            rf"\b{re.escape(word)}\b", "", cleaned, flags=re.IGNORECASE
-        )
+    cleaned = cleaned.strip(" ?!.,:;")
 
-    # Знаки препинания → пробелы, лишние пробелы убираем
-    cleaned = re.sub(r"[?!.,:;()\"'—–\-]", " ", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned or len(cleaned) < 2 or len(cleaned) > 60:
+        return ""
 
-    if not cleaned or len(cleaned) > 60:
+    if len(cleaned.split()) > 4:
         return ""
 
     return cleaned
@@ -217,7 +208,7 @@ def back_kb() -> InlineKeyboardMarkup:
 
 
 # ==================== ФОРМАТИРОВАНИЕ ====================
-def format_current_weather(city: str, data: dict, is_group: bool = False) -> str:
+def format_current_weather(city: str, data: dict) -> str:
     cur = data["current"]
     desc, emoji = decode_weather_code(cur["weather_code"])
 
@@ -247,7 +238,7 @@ def format_daily_forecast(city: str, data: dict) -> str:
     )
 
 
-# ==================== ОТПРАВКА ПОГОДЫ ====================
+# ==================== ОТПРАВКА ====================
 async def send_weather(
     message: Message,
     city: str,
@@ -257,7 +248,7 @@ async def send_weather(
     lat, lon, resolved = get_coordinates(city)
     if lat is None:
         text = f"❌ Город «{city}» не найден."
-        kb = main_menu_kb() if not is_group else None
+        kb = None if is_group else back_kb()
         kwargs = {}
         if is_group and reply_to and GROUP_SETTINGS["reply_to_user"]:
             kwargs["reply_to_message_id"] = reply_to.message_id
@@ -270,14 +261,14 @@ async def send_weather(
         return
 
     chat_last_city[message.chat.id] = resolved
-    kb = city_actions_kb(resolved) if not is_group else None
+    kb = None if is_group else city_actions_kb(resolved)
 
     kwargs = {}
     if is_group and reply_to and GROUP_SETTINGS["reply_to_user"]:
         kwargs["reply_to_message_id"] = reply_to.message_id
 
     await message.answer(
-        format_current_weather(resolved, data, is_group),
+        format_current_weather(resolved, data),
         reply_markup=kb,
         **kwargs,
     )
@@ -308,18 +299,18 @@ async def cmd_start(message: Message):
             "👋 <b>Привет!</b>\n\n"
             "Чтобы узнать погоду, напиши:\n"
             "• <code>погода Минск</code>\n"
-            "• <code>Какая погода в Москве?</code>\n"
-            "• <code>@имя_бота метео Париж</code>\n"
-            "• или ответь на моё сообщение\n\n"
+            "• <code>погода в Москве</code>\n"
+            "• <code>метео Париж</code>\n"
+            "• или просто <code>погода</code> — открою меню\n\n"
             "Команды: /weather, /help"
         )
+        await message.answer(text)
     else:
         text = (
             "👋 <b>Привет! Я бот погоды.</b>\n\n"
             "Выбери город из списка ниже или отправь его название в чат."
         )
-
-    await message.answer(text, reply_markup=main_menu_kb() if not is_group else None)
+        await message.answer(text, reply_markup=main_menu_kb())
 
 
 @dp.message(Command("help"))
@@ -331,11 +322,10 @@ async def cmd_help(message: Message):
             "ℹ️ <b>Как пользоваться ботом в группе</b>\n\n"
             "<b>Способы запросить погоду:</b>\n"
             "• <code>погода Минск</code>\n"
-            "• <code>Какая сегодня погода в Москве?</code>\n"
-            "• <code>метео Лондон</code>\n"
-            "• <code>weather Tokyo</code>\n"
-            "• ответом (reply) на моё сообщение\n\n"
-            "<b>Триггер-слова:</b> погода, метео, weather, прогноз, температура\n\n"
+            "• <code>погода в Москве</code>\n"
+            "• <code>метео Париж</code>\n"
+            "• <code>weather London</code>\n"
+            "• просто <code>погода</code> — открою меню\n\n"
             "<b>Команды:</b>\n"
             "• /weather <i>город</i> — погода\n"
             "• /weather — повторить последний город\n"
@@ -362,7 +352,15 @@ async def cmd_weather(message: Message):
     else:
         city = chat_last_city.get(message.chat.id)
         if not city:
-            await message.answer("📍 Укажи город: <code>/weather Минск</code>")
+            if is_group:
+                await message.answer(
+                    "🏙 <b>Выбери город:</b>",
+                    reply_markup=main_menu_kb(),
+                )
+            else:
+                await message.answer(
+                    "📍 Укажи город: <code>/weather Минск</code>"
+                )
             return
 
     await send_weather(
@@ -376,10 +374,6 @@ async def cmd_weather(message: Message):
 # ==================== INLINE-КНОПКИ ====================
 @dp.callback_query(F.data == "back_to_menu")
 async def cb_back_to_menu(callback: CallbackQuery):
-    is_group = callback.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
-    if is_group:
-        await callback.answer("Меню доступно только в личке с ботом", show_alert=True)
-        return
     await callback.message.edit_text("🏙 <b>Выбери город:</b>", reply_markup=main_menu_kb())
     await callback.answer()
 
@@ -428,49 +422,43 @@ async def cb_daily(callback: CallbackQuery):
     await callback.answer()
 
 
-# ==================== ГЛАВНЫЙ ХЕНДЛЕР ТЕКСТА ====================
+# ==================== ГЛАВНЫЙ ХЕНДЛЕР ====================
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text(message: Message):
     is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
     bot_username = (await bot.me()).username
 
     if is_group:
-        city = extract_city_from_text(message.text, bot_username)
+        result = extract_city_from_text(message.text, bot_username)
 
-        # Reply на сообщение бота — используем последний город
-        if city is None and message.reply_to_message:
+        # Reply на сообщение бота — повторяем последний город
+        if result is None and message.reply_to_message:
             if message.reply_to_message.from_user.id == bot.id:
                 last = chat_last_city.get(message.chat.id)
                 if last:
                     await send_weather(message, last, is_group=True, reply_to=message)
-                else:
-                    await message.reply(
-                        "📍 Укажи город, например: <code>погода Минск</code>",
-                        reply_to_message_id=message.message_id,
-                    )
                 return
 
-        # Триггера нет — молчим
-        if city is None:
+        # Нет триггера — молчим
+        if result is None:
             return
 
-        # Триггер есть, но город не указан
-        if city == "":
-            last = chat_last_city.get(message.chat.id)
-            if last:
-                await send_weather(message, last, is_group=True, reply_to=message)
-            else:
-                await message.reply(
-                    "📍 Укажи город, например: <code>погода Минск</code>",
-                    reply_to_message_id=message.message_id,
-                )
+        # Только триггер (без города) — показываем меню
+        if result == "":
+            await message.answer(
+                "🏙 <b>Выбери город:</b>",
+                reply_markup=main_menu_kb(),
+                reply_to_message_id=(
+                    message.message_id if GROUP_SETTINGS["reply_to_user"] else None
+                ),
+            )
             return
 
-        # Всё хорошо — показываем погоду
-        await send_weather(message, city, is_group=True, reply_to=message)
+        # Триггер + город — показываем погоду
+        await send_weather(message, result, is_group=True, reply_to=message)
 
     else:
-        # В личке реагируем на любой текст
+        # В личке — любое сообщение = название города
         city = message.text.strip()
         if not city:
             return
@@ -507,8 +495,8 @@ async def handle_location(message: Message):
         return
 
     await message.answer(
-        format_current_weather("Ваше местоположение", data, is_group),
-        reply_markup=city_actions_kb("Ваше местоположение") if not is_group else None,
+        format_current_weather("Ваше местоположение", data),
+        reply_markup=None if is_group else city_actions_kb("Ваше местоположение"),
     )
 
 
