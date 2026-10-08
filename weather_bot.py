@@ -172,6 +172,27 @@ def is_likely_city(word: str, position: int) -> bool:
     return True
 
 
+def word_variants(word: str):
+    """
+    Возвращает список вариантов слова с обрезанными падежными окончаниями.
+    Например: «Витебске» → ['Витебске', 'Витебск'], «Москве» → ['Москве', 'Москв', 'Москва'].
+    """
+    variants = [word]
+    wl = word.lower()
+
+    for suffix in ("ой", "ей", "е", "у", "ю", "а", "я", "ы", "и", "ом", "ем", "ах", "ях"):
+        if wl.endswith(suffix) and len(wl) - len(suffix) >= 3:
+            base = word[:-len(suffix)]
+            variants.append(base)
+            # Для женских: «москв» → «москва», «гомел» → «гомель»
+            if not base.endswith(("а", "я", "о", "е", "ь", "й", "у", "ю")):
+                variants.append(base + "а")
+                variants.append(base + "ь")
+            break
+
+    return variants
+
+
 def extract_city_from_text(text: str, bot_username: str):
     """
     Возвращает:
@@ -204,6 +225,7 @@ def extract_city_from_text(text: str, bot_username: str):
     if not words:
         return ""
 
+    # Собираем кандидатов: фразы (3, 2) и одиночные слова
     candidates = []
     for size in (3, 2, 1):
         for i in range(len(words) - size + 1):
@@ -221,6 +243,17 @@ def extract_city_from_text(text: str, bot_username: str):
 
             candidates.append(" ".join(phrase_words))
 
+            # Для одиночного слова — добавляем все варианты с обрезкой
+            if size == 1:
+                candidates.extend(word_variants(phrase_words[0]))
+            else:
+                # Для фраз — обрезаем только последнее слово
+                last_variants = word_variants(phrase_words[-1])
+                for lv in last_variants:
+                    if lv != phrase_words[-1]:
+                        candidates.append(" ".join(phrase_words[:-1] + [lv]))
+
+    # Убираем дубли
     seen = set()
     unique_candidates = []
     for c in candidates:
@@ -229,7 +262,10 @@ def extract_city_from_text(text: str, bot_username: str):
             seen.add(key)
             unique_candidates.append(c)
 
+    # Проверяем через API
     for candidate in unique_candidates:
+        if len(candidate) < 3:
+            continue
         lat, lon, resolved = get_coordinates(candidate)
         if lat is not None and resolved:
             if len(resolved) < 3:
