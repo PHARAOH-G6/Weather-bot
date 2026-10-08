@@ -29,7 +29,7 @@ WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 PORT = int(os.getenv("PORT", 10000))
 
-# Триггер-слова — ищутся в ЛЮБОМ месте сообщения
+# Триггер-слова — ищутся в любом месте сообщения
 TRIGGER_WORDS = [
     "погода", "погодка", "погоду", "погоде", "погоды", "погодой",
     "метео", "метеосводка",
@@ -40,26 +40,21 @@ TRIGGER_WORDS = [
 
 # Слова-мусор, которые точно не являются городом
 SKIP_WORDS = {
-    # предлоги и союзы
     "в", "во", "на", "для", "по", "о", "об", "про", "с", "со", "из", "от", "до",
     "и", "а", "но", "же", "ли", "бы", "не", "ни", "у", "к", "ко", "при", "над",
     "под", "за", "без", "через", "между",
     "for", "in", "at", "on", "the", "of", "to", "with", "and", "or",
-    # вопросительные / вводные
     "какая", "какой", "какое", "какие", "какую", "каком", "каких",
     "покажи", "скажи", "подскажи", "узнай", "хочу", "можно", "надо", "дай",
     "сегодня", "завтра", "вчера", "сейчас", "будет", "была", "был", "были",
     "пожалуйста", "плиз", "please", "давай", "давайте", "лучше",
     "нужно", "хотел", "хотела", "хотелось",
-    # сам триггер
     "погода", "погодка", "погоду", "погоде", "погоды", "погодой",
     "метео", "метеосводка", "weather", "прогноз", "температура",
-    # общие слова
     "ну", "что", "эту", "этот", "эта", "эти", "там", "тут", "где", "когда",
     "сделал", "сделай", "сделать", "показал", "показать", "покажешь",
     "меню", "список", "кнопка", "кнопки", "кнопку",
     "бот", "боте", "бота", "боту", "ботом",
-    # мат и ругань
     "ебашь", "ебал", "ебать", "ебала", "ебет", "ебут",
     "блядскую", "блядь", "блять", "бля", "блят",
     "хуй", "хуя", "хую", "хуем", "хуе", "хуё",
@@ -153,43 +148,35 @@ def decode_weather_code(code: int):
 
 
 # ==================== ПАРСИНГ ====================
-def normalize_city(word: str) -> str:
-    """Грубо отсекает падежные окончания для лучшего поиска в API."""
-    w = word.strip(" ?!.,:;()\"'—–-").lower()
-    if not w or len(w) < 2:
-        return ""
-    for suffix in ("ой", "ей", "е", "у", "ю", "а", "я", "ы", "и"):
-        if w.endswith(suffix) and len(w) - len(suffix) >= 3:
-            return w[:-len(suffix)]
-    return w
-
-
 def is_likely_city(word: str, position: int) -> bool:
-    """Эвристика: слово похоже на название города?"""
+    """
+    Эвристика: слово похоже на название города?
+    - Слово с большой буквы — пропускаем почти всегда
+    - Слово с маленькой буквы в начале — не город
+    - Отсекаем глаголы/наречия по окончаниям
+    """
     w = word.strip()
     if len(w) < 3:
         return False
 
+    # С большой буквы — имя собственное, почти всегда пропускаем
+    if w[0].isupper():
+        return True
+
     wl = w.lower()
 
-    # Отсеиваем глагольные/наречные окончания
+    # Только для слов в нижнем регистре проверяем "глагольные" окончания
     bad_suffixes = (
         "ать", "ить", "уть", "ыть", "еть",
         "ешь", "ишь", "ёшь",
         "ал", "ил", "ел", "ул", "ыл",
         "ла", "ло", "ли", "ле",
-        "но", "то", "же", "бы",
         "ся", "сь",
     )
     for suf in bad_suffixes:
         if wl.endswith(suf) and len(wl) - len(suf) >= 2:
             return False
 
-    # С большой буквы — вероятно имя собственное
-    if w[0].isupper():
-        return True
-
-    # Слово в нижнем регистре в начале — вряд ли город
     if position == 0:
         return False
 
@@ -235,45 +222,35 @@ def extract_city_from_text(text: str, bot_username: str):
         for i in range(len(words) - size + 1):
             phrase_words = words[i:i + size]
 
+            # Пропускаем, если хоть одно слово — стоп-слово
             if any(w.lower() in SKIP_WORDS for w in phrase_words):
                 continue
 
+            # Для одиночного слова — проверка эвристикой
             if size == 1:
-                w = phrase_words[0]
-                if not is_likely_city(w, i):
+                if not is_likely_city(phrase_words[0], i):
                     continue
             else:
+                # Для фраз — каждое слово ≥ 3 символов
                 if any(len(w) < 3 for w in phrase_words):
                     continue
 
             candidates.append(" ".join(phrase_words))
 
-    # Нормализация окончаний
-    extra = []
-    for c in candidates:
-        norm = " ".join(normalize_city(w) for w in c.split())
-        if norm and norm != c.lower():
-            extra.append(norm)
-    candidates.extend(extra)
-
     # Убираем дубли
     seen = set()
     unique_candidates = []
     for c in candidates:
-        if c.lower() not in seen:
-            seen.add(c.lower())
+        key = c.lower()
+        if key not in seen:
+            seen.add(key)
             unique_candidates.append(c)
 
     # Проверяем через API
     for candidate in unique_candidates:
-        if len(candidate) < 3:
-            continue
-        if candidate.islower() and len(candidate) < 4:
-            continue
-
         lat, lon, resolved = get_coordinates(candidate)
         if lat is not None and resolved:
-            # Защита: имя из API должно быть похоже на кандидата
+            # Защита от мусорных совпадений: имя из API должно быть похоже
             if len(resolved) < 3:
                 continue
             rl = resolved.lower()
