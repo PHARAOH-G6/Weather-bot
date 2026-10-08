@@ -367,7 +367,6 @@ async def send_weather(
 
     data = get_weather(lat, lon)
 
-    # Повторная попытка через 1 сек, если API не ответил
     if not data:
         await asyncio.sleep(1)
         data = get_weather(lat, lon)
@@ -672,6 +671,13 @@ async def main():
     webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
+
+    # Health-check для cron-job.org и UptimeRobot
+    async def healthcheck(request):
+        return web.Response(text="OK")
+
+    app.router.add_get("/", healthcheck)
+    app.router.add_get("/health", healthcheck)
 
     return app
 
