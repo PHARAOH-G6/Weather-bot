@@ -23,6 +23,7 @@ from aiohttp import web
 
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")  # Новый ключ weatherapi.com
 
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:10000")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
@@ -30,7 +31,7 @@ WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 PORT = int(os.getenv("PORT", 10000))
 
-# Триггер-слова — ищутся в начале сообщения
+# Триггер-слова — ищутся в любом месте сообщения
 TRIGGER_WORDS = [
     "погода", "погодка", "погоду", "погоде", "погоды", "погодой",
     "метео", "метеосводка",
@@ -43,10 +44,10 @@ TRIGGER_WORDS = [
 LINK_WORDS = ["в", "во", "на", "для", "по", "for", "in", "at"]
 
 # ==================== КЕШ ====================
-# Кеш координат: "минск" -> (lat, lon, "Минск")
-_coord_cache: dict[str, tuple] = {}
-# Кеш погоды: (lat, lon) -> (timestamp, data)
-_weather_cache: dict[tuple, tuple] = {}
+# Кеш городов: "минск" -> "Минск" (для случаев, когда API вернул другое имя)
+_city_cache: dict[str, str] = {}
+# Кеш погоды: "минск" -> (timestamp, data)
+_weather_cache: dict[str, tuple] = {}
 WEATHER_TTL = 900  # 15 минут
 
 POPULAR_CITIES = {
@@ -78,96 +79,63 @@ dp = Dispatcher()
 chat_last_city: dict[int, str] = {}
 
 
-# ==================== API ====================
-def get_coordinates(city_name: str):
-    """Получает координаты города. Кеширует навсегда."""
-    key = city_name.lower().strip()
-
-    if key in _coord_cache:
-        return _coord_cache[key]
-
-    url = "https://geocoding-api.open-meteo.com/v1/search"
-    params = {"name": city_name, "count": 1, "language": "ru", "format": "json"}
-
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code == 429:
-            print("⚠️ Geocoding 429 — лимит превышен")
-            return None, None, None
-        if r.status_code != 200:
-            print(f"⚠️ Geocoding {r.status_code}")
-            return None, None, None
-
-        data = r.json()
-        if "results" in data and data["results"]:
-            res = data["results"][0]
-            result = (res["latitude"], res["longitude"], res.get("name", city_name))
-            _coord_cache[key] = result
-            return result
-    except Exception as e:
-        print(f"⚠️ Geocoding error: {e}")
-
-    _coord_cache[key] = (None, None, None)
-    return None, None, None
-
-
-def get_weather(lat: float, lon: float):
-    """Получает погоду. Кеширует на 15 минут."""
-    key = (round(lat, 2), round(lon, 2))
+# ==================== API (weatherapi.com) ====================
+def get_weather_data(city: str):
+    """
+    Получает текущую погоду и прогноз на день через weatherapi.com.
+    Кеширует на 15 минут.
+    """
+    key = city.lower().strip()
     now = time.time()
 
+    # Кеш погоды
     if key in _weather_cache:
         ts, data = _weather_cache[key]
         if now - ts < WEATHER_TTL:
             return data
 
-    url = "https://api.open-meteo.com/v1/forecast"
+    url = "https://api.weatherapi.com/v1/forecast.json"
     params = {
-        "latitude": lat,
-        "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
-                   "weather_code,wind_speed_10m,pressure_msl",
-        "daily": "temperature_2m_max,temperature_2m_min,"
-                 "precipitation_probability_max,sunrise,sunset",
-        "timezone": "auto",
-        "forecast_days": 1,
+        "key": WEATHER_API_KEY,
+        "q": city,
+        "days": 1,
+        "aqi": "no",
+        "alerts": "no",
+        "lang": "ru",
     }
 
     try:
         r = requests.get(url, params=params, timeout=15)
-        if r.status_code == 429:
-            print("⚠️ Open-Meteo 429 — дневной лимит превышен")
+
+        if r.status_code == 400:
+            # Город не найден
+            data = r.json()
+            error_msg = data.get("error", {}).get("message", "")
+            if "No matching location found" in error_msg:
+                print(f"⚠️ Город не найден: {city}")
+                return None
+            print(f"⚠️ WeatherAPI 400: {error_msg}")
             return None
+
+        if r.status_code == 401:
+            print("⚠️ WeatherAPI: неверный API-ключ")
+            return None
+
+        if r.status_code == 403:
+            print("⚠️ WeatherAPI: лимит запросов исчерпан")
+            return None
+
         if r.status_code != 200:
-            print(f"⚠️ Open-Meteo {r.status_code}: {r.text[:200]}")
+            print(f"⚠️ WeatherAPI {r.status_code}: {r.text[:200]}")
             return None
 
         data = r.json()
         _weather_cache[key] = (now, data)
         return data
+
     except Exception as e:
-        print(f"⚠️ Weather error: {e}")
+        print(f"⚠️ WeatherAPI error: {e}")
         return None
-
-
-def decode_weather_code(code: int):
-    codes = {
-        0: ("Ясно", "☀️"), 1: ("Преимущественно ясно", "🌤"),
-        2: ("Переменная облачность", "⛅"), 3: ("Пасмурно", "☁️"),
-        45: ("Туман", "🌫"), 48: ("Оседающий туман", "🌫"),
-        51: ("Лёгкая морось", "🌦"), 53: ("Умеренная морось", "🌦"),
-        55: ("Плотная морось", "🌦"),
-        61: ("Небольшой дождь", "🌧"), 63: ("Умеренный дождь", "🌧"),
-        65: ("Сильный дождь", "🌧"),
-        71: ("Небольшой снег", "🌨"), 73: ("Умеренный снег", "🌨"),
-        75: ("Сильный снег", "🌨"), 77: ("Снежная крупа", "🌨"),
-        80: ("Ливень", "🌧"), 81: ("Сильный ливень", "🌧"),
-        82: ("Очень сильный ливень", "⛈"),
-        85: ("Снежный ливень", "🌨"), 86: ("Сильный снежный ливень", "🌨"),
-        95: ("Гроза", "⛈"), 96: ("Гроза с градом", "⛈"),
-        99: ("Сильная гроза с градом", "⛈"),
-    }
-    return codes.get(code, ("Неизвестно", "❓"))
 
 
 # ==================== ПАРСИНГ ====================
@@ -267,32 +235,34 @@ def back_kb() -> InlineKeyboardMarkup:
 # ==================== ФОРМАТИРОВАНИЕ ====================
 def format_current_weather(city: str, data: dict) -> str:
     cur = data["current"]
-    desc, emoji = decode_weather_code(cur["weather_code"])
+    location = data["location"]
 
     return (
-        f"<b>{emoji} Погода в {city}</b>\n"
+        f"<b>🌤 Погода в {location['name']}</b>\n"
         f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌡 <b>Температура:</b> {cur['temperature_2m']}°C\n"
-        f"🤔 <b>Ощущается:</b> {cur['apparent_temperature']}°C\n"
-        f"{emoji} <b>Состояние:</b> {desc}\n"
-        f"💧 <b>Влажность:</b> {cur['relative_humidity_2m']}%\n"
-        f"🌬 <b>Ветер:</b> {cur['wind_speed_10m']} км/ч\n"
-        f"📊 <b>Давление:</b> {round(cur['pressure_msl'] * 0.750064)} мм рт. ст.\n"
+        f"🌡 <b>Температура:</b> {cur['temp_c']}°C\n"
+        f"🤔 <b>Ощущается:</b> {cur['feelslike_c']}°C\n"
+        f"☁️ <b>Состояние:</b> {cur['condition']['text']}\n"
+        f"💧 <b>Влажность:</b> {cur['humidity']}%\n"
+        f"🌬 <b>Ветер:</b> {cur['wind_kph']} км/ч ({cur['wind_dir']})\n"
+        f"📊 <b>Давление:</b> {round(cur['pressure_mb'] * 0.750064)} мм рт. ст.\n"
         f"\n<i>🤖 {AUTHOR}</i>"
     )
 
 
 def format_daily_forecast(city: str, data: dict) -> str:
-    d = data["daily"]
+    day = data["forecast"]["forecastday"][0]["day"]
+    astro = data["forecast"]["forecastday"][0]["astro"]
+
     return (
         f"<b>📅 Прогноз на сегодня — {city}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔺 <b>Максимум:</b> {d['temperature_2m_max'][0]}°C\n"
-        f"🔻 <b>Минимум:</b> {d['temperature_2m_min'][0]}°C\n"
-        f"☔ <b>Осадки:</b> {d['precipitation_probability_max'][0]}%\n"
-        f"🌅 <b>Восход:</b> {d['sunrise'][0].split('T')[1]}\n"
-        f"🌇 <b>Закат:</b> {d['sunset'][0].split('T')[1]}\n"
+        f"🔺 <b>Максимум:</b> {day['maxtemp_c']}°C\n"
+        f"🔻 <b>Минимум:</b> {day['mintemp_c']}°C\n"
+        f"☔ <b>Осадки:</b> {day['daily_chance_of_rain']}%\n"
+        f"🌅 <b>Восход:</b> {astro['sunrise']}\n"
+        f"🌇 <b>Закат:</b> {astro['sunset']}\n"
         f"\n<i>🤖 {AUTHOR}</i>"
     )
 
@@ -304,22 +274,9 @@ async def send_weather(
     is_group: bool = False,
     reply_to: Message | None = None,
 ):
-    lat, lon, resolved = get_coordinates(city)
-    if lat is None:
-        text = f"❌ Город «{city}» не найден."
-        kb = None if is_group else back_kb()
-        kwargs = {}
-        if is_group and reply_to and GROUP_SETTINGS["reply_to_user"]:
-            kwargs["reply_to_message_id"] = reply_to.message_id
-        await message.answer(text, reply_markup=kb, **kwargs)
-        return
-
-    data = get_weather(lat, lon)
+    data = get_weather_data(city)
     if not data:
-        text = (
-            f"⚠️ Сервис погоды временно недоступен.\n"
-            f"Попробуй через минуту или завтра (лимит API)."
-        )
+        text = f"❌ Не удалось получить погоду для «{city}».\nПроверь название города."
         kb = None if is_group else back_kb()
         kwargs = {}
         if is_group and reply_to and GROUP_SETTINGS["reply_to_user"]:
@@ -327,6 +284,7 @@ async def send_weather(
         await message.answer(text, reply_markup=kb, **kwargs)
         return
 
+    resolved = data["location"]["name"]
     chat_last_city[message.chat.id] = resolved
     kb = None if is_group else city_actions_kb(resolved)
 
@@ -342,17 +300,15 @@ async def send_weather(
 
 
 async def show_weather_edit(message: Message, city: str):
-    lat, lon, resolved = get_coordinates(city)
-    if lat is None:
-        await message.edit_text(f"❌ Город «{city}» не найден.", reply_markup=back_kb())
-        return
-    data = get_weather(lat, lon)
+    data = get_weather_data(city)
     if not data:
         await message.edit_text(
-            "⚠️ Сервис погоды недоступен. Попробуй позже.",
+            f"❌ Город «{city}» не найден.",
             reply_markup=back_kb(),
         )
         return
+
+    resolved = data["location"]["name"]
     await message.edit_text(
         format_current_weather(resolved, data),
         reply_markup=city_actions_kb(resolved),
@@ -369,7 +325,6 @@ async def cmd_start(message: Message):
             "👋 <b>Привет!</b>\n\n"
             "Чтобы узнать погоду, напиши:\n"
             "• <code>погода Минск</code>\n"
-            "• <code>погода Москва</code>\n"
             "• <code>метео Париж</code>\n"
             "• или просто <code>погода</code> — открою меню\n\n"
             "<i>⚠️ Город указывай в именительном падеже</i>\n\n"
@@ -398,12 +353,9 @@ async def cmd_help(message: Message):
             "<b>Формат:</b> <code>погода Город</code>\n\n"
             "<b>Примеры:</b>\n"
             "• <code>погода Минск</code>\n"
-            "• <code>погода Москва</code>\n"
-            "• <code>метео Париж</code>\n"
+            "• <code>метео Москва</code>\n"
             "• <code>weather London</code>\n"
             "• <code>погода</code> — открою меню\n\n"
-            "<i>⚠️ Город пиши в именительном падеже:\n"
-            "«Минск», а не «Минске»</i>\n\n"
             "<b>Команды:</b>\n"
             "• /weather <i>город</i> — погода\n"
             "• /weather — повторить последний город\n"
@@ -480,10 +432,7 @@ async def cb_city(callback: CallbackQuery):
 async def cb_refresh(callback: CallbackQuery):
     city = callback.data.split(":", 1)[1]
     # Сбрасываем кеш для этого города
-    lat, lon, _ = get_coordinates(city)
-    if lat is not None:
-        key = (round(lat, 2), round(lon, 2))
-        _weather_cache.pop(key, None)
+    _weather_cache.pop(city.lower().strip(), None)
     await show_weather_edit(callback.message, city)
     await callback.answer("🔄 Обновлено")
 
@@ -491,15 +440,12 @@ async def cb_refresh(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("daily:"))
 async def cb_daily(callback: CallbackQuery):
     city = callback.data.split(":", 1)[1]
-    lat, lon, resolved = get_coordinates(city)
-    if lat is None:
-        await callback.answer("Город не найден", show_alert=True)
-        return
-    data = get_weather(lat, lon)
-    if not data or "daily" not in data:
+    data = get_weather_data(city)
+    if not data or "forecast" not in data:
         await callback.answer("Не удалось получить прогноз", show_alert=True)
         return
 
+    resolved = data["location"]["name"]
     await callback.message.edit_text(
         format_daily_forecast(resolved, data),
         reply_markup=city_actions_kb(city),
@@ -550,21 +496,15 @@ async def handle_text(message: Message):
             return
 
         wait = await message.answer(f"🔍 Ищу погоду для «{city}»...")
-        lat, lon, resolved = get_coordinates(city)
-        if lat is None:
+        data = get_weather_data(city)
+        if not data:
             await wait.edit_text(
                 f"❌ Город «{city}» не найден.\nПопробуй другое название.",
                 reply_markup=back_kb(),
             )
             return
-        data = get_weather(lat, lon)
-        if not data:
-            await wait.edit_text(
-                "⚠️ Сервис погоды недоступен. Попробуй позже.",
-                reply_markup=back_kb(),
-            )
-            return
 
+        resolved = data["location"]["name"]
         chat_last_city[message.chat.id] = resolved
         await wait.edit_text(
             format_current_weather(resolved, data),
@@ -578,14 +518,18 @@ async def handle_location(message: Message):
     is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
     lat = message.location.latitude
     lon = message.location.longitude
-    data = get_weather(lat, lon)
+
+    # weatherapi.com принимает координаты как "lat,lon"
+    city = f"{lat},{lon}"
+    data = get_weather_data(city)
     if not data:
         await message.answer("❌ Не удалось получить погоду по геолокации.")
         return
 
+    resolved = data["location"]["name"]
     await message.answer(
-        format_current_weather("Ваше местоположение", data),
-        reply_markup=None if is_group else city_actions_kb("Ваше местоположение"),
+        format_current_weather(resolved, data),
+        reply_markup=None if is_group else city_actions_kb(resolved),
     )
 
 
