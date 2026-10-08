@@ -82,6 +82,9 @@ GROUP_SETTINGS = {
     "reply_to_user": True,
 }
 
+AUTHOR = '@PHARAOH_G6'
+AUTHOR_URL = 'https://t.me/PHARAOH_G6'
+
 # ==================== ИНИЦИАЛИЗАЦИЯ ====================
 bot = Bot(
     token=BOT_TOKEN,
@@ -149,36 +152,22 @@ def decode_weather_code(code: int):
 
 # ==================== ПАРСИНГ ====================
 def is_likely_city(word: str, position: int) -> bool:
-    """
-    Эвристика: слово похоже на название города?
-    - Слово с большой буквы — пропускаем почти всегда
-    - Слово с маленькой буквы в начале — не город
-    - Отсекаем глаголы/наречия по окончаниям
-    """
+    """Эвристика: слово похоже на название города? Регистр не учитываем."""
     w = word.strip()
     if len(w) < 3:
         return False
 
-    # С большой буквы — имя собственное, почти всегда пропускаем
-    if w[0].isupper():
-        return True
-
     wl = w.lower()
-
-    # Только для слов в нижнем регистре проверяем "глагольные" окончания
     bad_suffixes = (
         "ать", "ить", "уть", "ыть", "еть",
         "ешь", "ишь", "ёшь",
         "ал", "ил", "ел", "ул", "ыл",
-        "ла", "ло", "ли", "ле",
+        "ла", "ло", "ли",
         "ся", "сь",
     )
     for suf in bad_suffixes:
         if wl.endswith(suf) and len(wl) - len(suf) >= 2:
             return False
-
-    if position == 0:
-        return False
 
     return True
 
@@ -204,7 +193,6 @@ def extract_city_from_text(text: str, bot_username: str):
     if not trigger_found:
         return None
 
-    # Убираем триггер-слова
     for word in TRIGGER_WORDS:
         cleaned = re.sub(
             rf"\b{re.escape(word)}\w*\b", " ", cleaned, flags=re.IGNORECASE
@@ -216,28 +204,23 @@ def extract_city_from_text(text: str, bot_username: str):
     if not words:
         return ""
 
-    # Собираем кандидатов: 3, 2, 1 слово
     candidates = []
     for size in (3, 2, 1):
         for i in range(len(words) - size + 1):
             phrase_words = words[i:i + size]
 
-            # Пропускаем, если хоть одно слово — стоп-слово
             if any(w.lower() in SKIP_WORDS for w in phrase_words):
                 continue
 
-            # Для одиночного слова — проверка эвристикой
             if size == 1:
                 if not is_likely_city(phrase_words[0], i):
                     continue
             else:
-                # Для фраз — каждое слово ≥ 3 символов
                 if any(len(w) < 3 for w in phrase_words):
                     continue
 
             candidates.append(" ".join(phrase_words))
 
-    # Убираем дубли
     seen = set()
     unique_candidates = []
     for c in candidates:
@@ -246,11 +229,9 @@ def extract_city_from_text(text: str, bot_username: str):
             seen.add(key)
             unique_candidates.append(c)
 
-    # Проверяем через API
     for candidate in unique_candidates:
         lat, lon, resolved = get_coordinates(candidate)
         if lat is not None and resolved:
-            # Защита от мусорных совпадений: имя из API должно быть похоже
             if len(resolved) < 3:
                 continue
             rl = resolved.lower()
@@ -310,7 +291,8 @@ def format_current_weather(city: str, data: dict) -> str:
         f"{emoji} <b>Состояние:</b> {desc}\n"
         f"💧 <b>Влажность:</b> {cur['relative_humidity_2m']}%\n"
         f"🌬 <b>Ветер:</b> {cur['wind_speed_10m']} км/ч\n"
-        f"📊 <b>Давление:</b> {round(cur['pressure_msl'] * 0.750064)} мм рт. ст."
+        f"📊 <b>Давление:</b> {round(cur['pressure_msl'] * 0.750064)} мм рт. ст.\n"
+        f"\n<i>🤖 {AUTHOR}</i>"
     )
 
 
@@ -323,7 +305,8 @@ def format_daily_forecast(city: str, data: dict) -> str:
         f"🔻 <b>Минимум:</b> {d['temperature_2m_min'][0]}°C\n"
         f"☔ <b>Осадки:</b> {d['precipitation_probability_max'][0]}%\n"
         f"🌅 <b>Восход:</b> {d['sunrise'][0].split('T')[1]}\n"
-        f"🌇 <b>Закат:</b> {d['sunset'][0].split('T')[1]}"
+        f"🌇 <b>Закат:</b> {d['sunset'][0].split('T')[1]}\n"
+        f"\n<i>🤖 {AUTHOR}</i>"
     )
 
 
@@ -391,13 +374,17 @@ async def cmd_start(message: Message):
             "• <code>погода в Москве</code>\n"
             "• <code>метео Париж</code>\n"
             "• или просто <code>погода</code> — открою меню\n\n"
-            "Команды: /weather, /help"
+            "Команды: /weather, /help\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 Бот создан <a href=\"{AUTHOR_URL}\">{AUTHOR}</a>"
         )
         await message.answer(text)
     else:
         text = (
             "👋 <b>Привет! Я бот погоды.</b>\n\n"
-            "Выбери город из списка ниже или отправь его название в чат."
+            "Выбери город из списка ниже или отправь его название в чат.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 Бот создан <a href=\"{AUTHOR_URL}\">{AUTHOR}</a>"
         )
         await message.answer(text, reply_markup=main_menu_kb())
 
@@ -418,14 +405,18 @@ async def cmd_help(message: Message):
             "<b>Команды:</b>\n"
             "• /weather <i>город</i> — погода\n"
             "• /weather — повторить последний город\n"
-            "• /help — эта справка"
+            "• /help — эта справка\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 Бот создан <a href=\"{AUTHOR_URL}\">{AUTHOR}</a>"
         )
     else:
         text = (
             "ℹ️ <b>Как пользоваться ботом</b>\n\n"
             "• Нажми на кнопку с городом\n"
             "• Или напиши название города вручную\n"
-            "• В группе: <code>погода Минск</code>"
+            "• В группе: <code>погода Минск</code>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 Бот создан <a href=\"{AUTHOR_URL}\">{AUTHOR}</a>"
         )
 
     await message.answer(text)
