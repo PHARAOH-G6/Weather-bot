@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import time
 import requests
 from datetime import datetime
 
@@ -29,7 +30,7 @@ WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 PORT = int(os.getenv("PORT", 10000))
 
-# Триггер-слова — ищутся в любом месте сообщения
+# Триггер-слова — ищутся в начале сообщения
 TRIGGER_WORDS = [
     "погода", "погодка", "погоду", "погоде", "погоды", "погодой",
     "метео", "метеосводка",
@@ -38,32 +39,15 @@ TRIGGER_WORDS = [
     "температура",
 ]
 
-# Слова-мусор, которые точно не являются городом
-SKIP_WORDS = {
-    "в", "во", "на", "для", "по", "о", "об", "про", "с", "со", "из", "от", "до",
-    "и", "а", "но", "же", "ли", "бы", "не", "ни", "у", "к", "ко", "при", "над",
-    "под", "за", "без", "через", "между",
-    "for", "in", "at", "on", "the", "of", "to", "with", "and", "or",
-    "какая", "какой", "какое", "какие", "какую", "каком", "каких",
-    "покажи", "скажи", "подскажи", "узнай", "хочу", "можно", "надо", "дай",
-    "сегодня", "завтра", "вчера", "сейчас", "будет", "была", "был", "были",
-    "пожалуйста", "плиз", "please", "давай", "давайте", "лучше",
-    "нужно", "хотел", "хотела", "хотелось",
-    "погода", "погодка", "погоду", "погоде", "погоды", "погодой",
-    "метео", "метеосводка", "weather", "прогноз", "температура",
-    "ну", "что", "эту", "этот", "эта", "эти", "там", "тут", "где", "когда",
-    "сделал", "сделай", "сделать", "показал", "показать", "покажешь",
-    "меню", "список", "кнопка", "кнопки", "кнопку",
-    "бот", "боте", "бота", "боту", "ботом",
-    "ебашь", "ебал", "ебать", "ебала", "ебет", "ебут",
-    "блядскую", "блядь", "блять", "бля", "блят",
-    "хуй", "хуя", "хую", "хуем", "хуе", "хуё",
-    "пиздец", "пизда", "пизды", "пизду",
-    "пидорас", "пидор", "пидр",
-    "сука", "суки", "суку", "сучка", "сучки",
-    "нах", "нахуй", "нахер", "нахрен",
-    "нет", "да", "бог", "боже", "господи",
-}
+# Предлоги между триггером и городом
+LINK_WORDS = ["в", "во", "на", "для", "по", "for", "in", "at"]
+
+# ==================== КЕШ ====================
+# Кеш координат: "минск" -> (lat, lon, "Минск")
+_coord_cache: dict[str, tuple] = {}
+# Кеш погоды: (lat, lon) -> (timestamp, data)
+_weather_cache: dict[tuple, tuple] = {}
+WEATHER_TTL = 900  # 15 минут
 
 POPULAR_CITIES = {
     "Минск": "🇧🇾",
@@ -96,25 +80,47 @@ chat_last_city: dict[int, str] = {}
 
 # ==================== API ====================
 def get_coordinates(city_name: str):
+    """Получает координаты города. Кеширует навсегда."""
+    key = city_name.lower().strip()
+
+    if key in _coord_cache:
+        return _coord_cache[key]
+
     url = "https://geocoding-api.open-meteo.com/v1/search"
     params = {"name": city_name, "count": 1, "language": "ru", "format": "json"}
-    for attempt in range(2):
-        try:
-            r = requests.get(url, params=params, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                if "results" in data and data["results"]:
-                    res = data["results"][0]
-                    return res["latitude"], res["longitude"], res.get("name", city_name)
-                return None, None, None
-            else:
-                print(f"⚠️ Geocoding {r.status_code}: {r.text[:200]}")
-        except Exception as e:
-            print(f"⚠️ Geocoding error (try {attempt + 1}): {e}")
+
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code == 429:
+            print("⚠️ Geocoding 429 — лимит превышен")
+            return None, None, None
+        if r.status_code != 200:
+            print(f"⚠️ Geocoding {r.status_code}")
+            return None, None, None
+
+        data = r.json()
+        if "results" in data and data["results"]:
+            res = data["results"][0]
+            result = (res["latitude"], res["longitude"], res.get("name", city_name))
+            _coord_cache[key] = result
+            return result
+    except Exception as e:
+        print(f"⚠️ Geocoding error: {e}")
+
+    _coord_cache[key] = (None, None, None)
     return None, None, None
 
 
 def get_weather(lat: float, lon: float):
+    """Получает погоду. Кеширует на 15 минут."""
+    key = (round(lat, 2), round(lon, 2))
+    now = time.time()
+
+    if key in _weather_cache:
+        ts, data = _weather_cache[key]
+        if now - ts < WEATHER_TTL:
+            return data
+
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -126,16 +132,22 @@ def get_weather(lat: float, lon: float):
         "timezone": "auto",
         "forecast_days": 1,
     }
-    for attempt in range(3):
-        try:
-            r = requests.get(url, params=params, timeout=20)
-            if r.status_code == 200:
-                return r.json()
-            else:
-                print(f"⚠️ Open-Meteo {r.status_code}: {r.text[:200]}")
-        except Exception as e:
-            print(f"⚠️ Weather error (try {attempt + 1}): {e}")
-    return None
+
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code == 429:
+            print("⚠️ Open-Meteo 429 — дневной лимит превышен")
+            return None
+        if r.status_code != 200:
+            print(f"⚠️ Open-Meteo {r.status_code}: {r.text[:200]}")
+            return None
+
+        data = r.json()
+        _weather_cache[key] = (now, data)
+        return data
+    except Exception as e:
+        print(f"⚠️ Weather error: {e}")
+        return None
 
 
 def decode_weather_code(code: int):
@@ -159,126 +171,63 @@ def decode_weather_code(code: int):
 
 
 # ==================== ПАРСИНГ ====================
-def is_likely_city(word: str, position: int) -> bool:
-    """Эвристика: слово похоже на название города? Регистр не учитываем."""
-    w = word.strip()
-    if len(w) < 3:
-        return False
-
-    wl = w.lower()
-    bad_suffixes = (
-        "ать", "ить", "уть", "ыть", "еть",
-        "ешь", "ишь", "ёшь",
-        "ал", "ил", "ел", "ул", "ыл",
-        "ла", "ло", "ли",
-        "ся", "сь",
-    )
-    for suf in bad_suffixes:
-        if wl.endswith(suf) and len(wl) - len(suf) >= 2:
-            return False
-
-    return True
-
-
-def word_variants(word: str):
-    """
-    Возвращает список вариантов слова с обрезанными падежными окончаниями.
-    «Витебске» → ['Витебске', 'Витебск'], «Москве» → ['Москве', 'Москв', 'Москва'].
-    """
-    variants = [word]
-    wl = word.lower()
-
-    for suffix in ("ой", "ей", "е", "у", "ю", "а", "я", "ы", "и", "ом", "ем", "ах", "ях"):
-        if wl.endswith(suffix) and len(wl) - len(suffix) >= 3:
-            base = word[:-len(suffix)]
-            variants.append(base)
-            if not base.endswith(("а", "я", "о", "е", "ь", "й", "у", "ю")):
-                variants.append(base + "а")
-                variants.append(base + "ь")
-            break
-
-    return variants
-
-
 def extract_city_from_text(text: str, bot_username: str):
     """
+    Простой парсер: <триггер> [<предлог>] <город>
     Возвращает:
-      - строку с городом — если найден через API
-      - ""              — триггер есть, но города нет → показать меню
-      - None            — триггера нет вообще → молчать
+      - строку с городом — если триггер + город
+      - ""              — только триггер → меню
+      - None            — нет триггера → молчать
     """
     if not text:
         return None
 
     original = text.strip()
 
+    # Убираем упоминание бота в начале
     cleaned = re.sub(
-        rf"@{re.escape(bot_username)}\b", " ", original, flags=re.IGNORECASE
-    )
+        rf"^@{re.escape(bot_username)}\b[,:\s]*", "", original, flags=re.IGNORECASE
+    ).strip()
 
-    lowered = cleaned.lower()
-    trigger_found = any(word in lowered for word in TRIGGER_WORDS)
-    if not trigger_found:
-        return None
-
+    # Ищем триггер в начале сообщения
+    trigger_found = False
     for word in TRIGGER_WORDS:
+        pattern = rf"^{re.escape(word)}\w*\b[\s,:!?-]*"
+        if re.match(pattern, cleaned, flags=re.IGNORECASE):
+            trigger_found = True
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+            break
+
+    if not trigger_found:
+        # Триггер может быть в середине
+        lowered = cleaned.lower()
+        if not any(word in lowered for word in TRIGGER_WORDS):
+            return None
+        # Убираем триггер из любого места
+        for word in TRIGGER_WORDS:
+            cleaned = re.sub(
+                rf"\b{re.escape(word)}\w*\b", " ", cleaned, flags=re.IGNORECASE
+            )
+        cleaned = cleaned.strip()
+
+    # Убираем предлог в начале
+    for link in LINK_WORDS:
         cleaned = re.sub(
-            rf"\b{re.escape(word)}\w*\b", " ", cleaned, flags=re.IGNORECASE
-        )
+            rf"^{re.escape(link)}\s+", "", cleaned, flags=re.IGNORECASE
+        ).strip()
 
-    cleaned = re.sub(r"[?!.,:;()\"'—–\-]", " ", cleaned)
-    words = [w for w in cleaned.split() if w]
+    # Чистим пунктуацию
+    cleaned = cleaned.strip(" ?!.,:;")
 
-    if not words:
+    # Если пусто — только триггер был
+    if not cleaned or len(cleaned) < 2 or len(cleaned) > 50:
         return ""
 
-    candidates = []
-    for size in (3, 2, 1):
-        for i in range(len(words) - size + 1):
-            phrase_words = words[i:i + size]
+    # Слишком много слов — вряд ли название города
+    if len(cleaned.split()) > 3:
+        return ""
 
-            if any(w.lower() in SKIP_WORDS for w in phrase_words):
-                continue
-
-            if size == 1:
-                if not is_likely_city(phrase_words[0], i):
-                    continue
-            else:
-                if any(len(w) < 3 for w in phrase_words):
-                    continue
-
-            candidates.append(" ".join(phrase_words))
-
-            if size == 1:
-                candidates.extend(word_variants(phrase_words[0]))
-            else:
-                last_variants = word_variants(phrase_words[-1])
-                for lv in last_variants:
-                    if lv != phrase_words[-1]:
-                        candidates.append(" ".join(phrase_words[:-1] + [lv]))
-
-    seen = set()
-    unique_candidates = []
-    for c in candidates:
-        key = c.lower()
-        if key not in seen:
-            seen.add(key)
-            unique_candidates.append(c)
-
-    for candidate in unique_candidates:
-        if len(candidate) < 3:
-            continue
-        lat, lon, resolved = get_coordinates(candidate)
-        if lat is not None and resolved:
-            if len(resolved) < 3:
-                continue
-            rl = resolved.lower()
-            cl = candidate.lower()
-            if not (rl.startswith(cl[:3]) or cl.startswith(rl[:3])):
-                continue
-            return resolved
-
-    return ""
+    return cleaned
 
 
 # ==================== КЛАВИАТУРЫ ====================
@@ -366,15 +315,10 @@ async def send_weather(
         return
 
     data = get_weather(lat, lon)
-
-    if not data:
-        await asyncio.sleep(1)
-        data = get_weather(lat, lon)
-
     if not data:
         text = (
-            f"❌ Не удалось получить данные о погоде для «{resolved}».\n"
-            "Попробуй ещё раз через пару секунд."
+            f"⚠️ Сервис погоды временно недоступен.\n"
+            f"Попробуй через минуту или завтра (лимит API)."
         )
         kb = None if is_group else back_kb()
         kwargs = {}
@@ -404,11 +348,8 @@ async def show_weather_edit(message: Message, city: str):
         return
     data = get_weather(lat, lon)
     if not data:
-        await asyncio.sleep(1)
-        data = get_weather(lat, lon)
-    if not data:
         await message.edit_text(
-            "❌ Не удалось получить погоду. Попробуй ещё раз.",
+            "⚠️ Сервис погоды недоступен. Попробуй позже.",
             reply_markup=back_kb(),
         )
         return
@@ -428,9 +369,10 @@ async def cmd_start(message: Message):
             "👋 <b>Привет!</b>\n\n"
             "Чтобы узнать погоду, напиши:\n"
             "• <code>погода Минск</code>\n"
-            "• <code>погода в Москве</code>\n"
+            "• <code>погода Москва</code>\n"
             "• <code>метео Париж</code>\n"
             "• или просто <code>погода</code> — открою меню\n\n"
+            "<i>⚠️ Город указывай в именительном падеже</i>\n\n"
             "Команды: /weather, /help\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"🤖 Бот создан <a href=\"{AUTHOR_URL}\">{AUTHOR}</a>"
@@ -453,12 +395,15 @@ async def cmd_help(message: Message):
     if is_group:
         text = (
             "ℹ️ <b>Как пользоваться ботом в группе</b>\n\n"
+            "<b>Формат:</b> <code>погода Город</code>\n\n"
             "<b>Примеры:</b>\n"
             "• <code>погода Минск</code>\n"
-            "• <code>погода в Москве</code>\n"
+            "• <code>погода Москва</code>\n"
             "• <code>метео Париж</code>\n"
             "• <code>weather London</code>\n"
-            "• просто <code>погода</code> — открою меню\n\n"
+            "• <code>погода</code> — открою меню\n\n"
+            "<i>⚠️ Город пиши в именительном падеже:\n"
+            "«Минск», а не «Минске»</i>\n\n"
             "<b>Команды:</b>\n"
             "• /weather <i>город</i> — погода\n"
             "• /weather — повторить последний город\n"
@@ -471,9 +416,7 @@ async def cmd_help(message: Message):
             "ℹ️ <b>Как пользоваться ботом</b>\n\n"
             "• Нажми на кнопку с городом\n"
             "• Или напиши название города вручную\n"
-            "• В группе: <code>погода Минск</code>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🤖 Бот создан <a href=\"{AUTHOR_URL}\">{AUTHOR}</a>"
+            "• В группе: <code>погода Минск</code>"
         )
 
     await message.answer(text)
@@ -536,6 +479,11 @@ async def cb_city(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("refresh:"))
 async def cb_refresh(callback: CallbackQuery):
     city = callback.data.split(":", 1)[1]
+    # Сбрасываем кеш для этого города
+    lat, lon, _ = get_coordinates(city)
+    if lat is not None:
+        key = (round(lat, 2), round(lon, 2))
+        _weather_cache.pop(key, None)
     await show_weather_edit(callback.message, city)
     await callback.answer("🔄 Обновлено")
 
@@ -596,6 +544,7 @@ async def handle_text(message: Message):
         await send_weather(message, result, is_group=True, reply_to=message)
 
     else:
+        # В личке — любое сообщение = название города
         city = message.text.strip()
         if not city:
             return
@@ -610,11 +559,8 @@ async def handle_text(message: Message):
             return
         data = get_weather(lat, lon)
         if not data:
-            await asyncio.sleep(1)
-            data = get_weather(lat, lon)
-        if not data:
             await wait.edit_text(
-                "❌ Не удалось получить данные. Попробуй ещё раз.",
+                "⚠️ Сервис погоды недоступен. Попробуй позже.",
                 reply_markup=back_kb(),
             )
             return
@@ -672,7 +618,6 @@ async def main():
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 
-    # Health-check для cron-job.org и UptimeRobot
     async def healthcheck(request):
         return web.Response(text="OK")
 
