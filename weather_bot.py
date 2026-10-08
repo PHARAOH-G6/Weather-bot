@@ -21,22 +21,34 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 
 # ==================== НАСТРОЙКИ ====================
-# Токен берём из переменных окружения Render (Environment → BOT_TOKEN)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Render автоматически подставит свой домен в RENDER_EXTERNAL_URL
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:10000")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-# Порт, который слушает Render
 PORT = int(os.getenv("PORT", 10000))
 
-# Триггер-слова для работы в группах
-TRIGGER_WORDS = ["погода", "weather", "погодка"]
-ADDRESS_WORDS = ["бот", "bot"]
+# Триггер-слова — ищутся в ЛЮБОМ месте сообщения
+TRIGGER_WORDS = [
+    "погода", "погодка", "погоду", "погоде", "погоды",
+    "метео", "метеосводка",
+    "weather",
+    "прогноз",
+    "температура",
+    "сколько градусов",
+]
 
-# Популярные города для inline-кнопок
+# Стоп-слова — убираем из текста, чтобы найти название города
+STOP_WORDS = [
+    "в", "во", "на", "для", "по", "о", "об", "про",
+    "какая", "какой", "какое", "какие",
+    "покажи", "скажи", "подскажи", "узнай",
+    "сегодня", "завтра", "сейчас", "будет",
+    "for", "in", "the", "at",
+    "пожалуйста", "плиз",
+]
+
 POPULAR_CITIES = {
     "Минск": "🇧🇾",
     "Москва": "🇷🇺",
@@ -122,34 +134,50 @@ def decode_weather_code(code: int):
 
 # ==================== ПАРСИНГ СООБЩЕНИЙ ====================
 def extract_city_from_text(text: str, bot_username: str) -> str | None:
-    """Извлекает город из текста, если есть триггер или упоминание бота."""
+    """
+    Извлекает город из текста.
+    Триггер-слово ищется в ЛЮБОМ месте сообщения.
+    Возвращает:
+      - строку с городом — если триггер найден и город распознан
+      - "" (пустую строку) — если триггер есть, но город не указан
+      - None — если триггера нет вообще (бот молчит)
+    """
     if not text:
         return None
 
     original = text.strip()
     lowered = original.lower()
 
-    cleaned = re.sub(rf"@{re.escape(bot_username)}\b", "", original, flags=re.IGNORECASE).strip()
-
-    starts_with_trigger = any(cleaned.lower().startswith(tw) for tw in TRIGGER_WORDS)
-    starts_with_address = any(cleaned.lower().startswith(aw) for aw in ADDRESS_WORDS)
     mentioned_bot = f"@{bot_username.lower()}" in lowered
 
-    if not (starts_with_trigger or starts_with_address or mentioned_bot):
+    trigger_found = any(word in lowered for word in TRIGGER_WORDS)
+
+    if not (trigger_found or mentioned_bot):
         return None
 
-    for word in TRIGGER_WORDS + ADDRESS_WORDS:
-        cleaned = re.sub(
-            rf"^{re.escape(word)}[\s,:!?-]*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        ).strip()
+    # Убираем упоминание бота
+    cleaned = re.sub(
+        rf"@{re.escape(bot_username)}\b", "", original, flags=re.IGNORECASE
+    )
 
-    cleaned = cleaned.strip(" ?!.,:;")
+    # Убираем триггер-слова
+    for word in TRIGGER_WORDS:
+        cleaned = re.sub(
+            rf"\b{re.escape(word)}\w*\b", "", cleaned, flags=re.IGNORECASE
+        )
+
+    # Убираем стоп-слова
+    for word in STOP_WORDS:
+        cleaned = re.sub(
+            rf"\b{re.escape(word)}\b", "", cleaned, flags=re.IGNORECASE
+        )
+
+    # Знаки препинания → пробелы, лишние пробелы убираем
+    cleaned = re.sub(r"[?!.,:;()\"'—–\-]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
     if not cleaned or len(cleaned) > 60:
-        return None
+        return ""
 
     return cleaned
 
@@ -219,7 +247,7 @@ def format_daily_forecast(city: str, data: dict) -> str:
     )
 
 
-# ==================== ОБЩАЯ ФУНКЦИЯ ОТВЕТА ====================
+# ==================== ОТПРАВКА ПОГОДЫ ====================
 async def send_weather(
     message: Message,
     city: str,
@@ -280,7 +308,8 @@ async def cmd_start(message: Message):
             "👋 <b>Привет!</b>\n\n"
             "Чтобы узнать погоду, напиши:\n"
             "• <code>погода Минск</code>\n"
-            "• <code>@имя_бота погода Москва</code>\n"
+            "• <code>Какая погода в Москве?</code>\n"
+            "• <code>@имя_бота метео Париж</code>\n"
             "• или ответь на моё сообщение\n\n"
             "Команды: /weather, /help"
         )
@@ -302,9 +331,11 @@ async def cmd_help(message: Message):
             "ℹ️ <b>Как пользоваться ботом в группе</b>\n\n"
             "<b>Способы запросить погоду:</b>\n"
             "• <code>погода Минск</code>\n"
-            "• <code>weather London</code>\n"
-            "• <code>@имя_бота погода Париж</code>\n"
+            "• <code>Какая сегодня погода в Москве?</code>\n"
+            "• <code>метео Лондон</code>\n"
+            "• <code>weather Tokyo</code>\n"
             "• ответом (reply) на моё сообщение\n\n"
+            "<b>Триггер-слова:</b> погода, метео, weather, прогноз, температура\n\n"
             "<b>Команды:</b>\n"
             "• /weather <i>город</i> — погода\n"
             "• /weather — повторить последний город\n"
@@ -406,15 +437,40 @@ async def handle_text(message: Message):
     if is_group:
         city = extract_city_from_text(message.text, bot_username)
 
+        # Reply на сообщение бота — используем последний город
         if city is None and message.reply_to_message:
             if message.reply_to_message.from_user.id == bot.id:
-                city = message.text.strip() or chat_last_city.get(message.chat.id)
+                last = chat_last_city.get(message.chat.id)
+                if last:
+                    await send_weather(message, last, is_group=True, reply_to=message)
+                else:
+                    await message.reply(
+                        "📍 Укажи город, например: <code>погода Минск</code>",
+                        reply_to_message_id=message.message_id,
+                    )
+                return
 
+        # Триггера нет — молчим
         if city is None:
             return
 
+        # Триггер есть, но город не указан
+        if city == "":
+            last = chat_last_city.get(message.chat.id)
+            if last:
+                await send_weather(message, last, is_group=True, reply_to=message)
+            else:
+                await message.reply(
+                    "📍 Укажи город, например: <code>погода Минск</code>",
+                    reply_to_message_id=message.message_id,
+                )
+            return
+
+        # Всё хорошо — показываем погоду
         await send_weather(message, city, is_group=True, reply_to=message)
+
     else:
+        # В личке реагируем на любой текст
         city = message.text.strip()
         if not city:
             return
