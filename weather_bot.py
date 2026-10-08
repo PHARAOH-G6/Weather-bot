@@ -98,15 +98,19 @@ chat_last_city: dict[int, str] = {}
 def get_coordinates(city_name: str):
     url = "https://geocoding-api.open-meteo.com/v1/search"
     params = {"name": city_name, "count": 1, "language": "ru", "format": "json"}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if "results" in data and data["results"]:
-            res = data["results"][0]
-            return res["latitude"], res["longitude"], res.get("name", city_name)
-    except Exception:
-        pass
+    for attempt in range(2):
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if "results" in data and data["results"]:
+                    res = data["results"][0]
+                    return res["latitude"], res["longitude"], res.get("name", city_name)
+                return None, None, None
+            else:
+                print(f"⚠️ Geocoding {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            print(f"⚠️ Geocoding error (try {attempt + 1}): {e}")
     return None, None, None
 
 
@@ -122,12 +126,16 @@ def get_weather(lat: float, lon: float):
         "timezone": "auto",
         "forecast_days": 1,
     }
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            else:
+                print(f"⚠️ Open-Meteo {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            print(f"⚠️ Weather error (try {attempt + 1}): {e}")
+    return None
 
 
 def decode_weather_code(code: int):
@@ -175,7 +183,7 @@ def is_likely_city(word: str, position: int) -> bool:
 def word_variants(word: str):
     """
     Возвращает список вариантов слова с обрезанными падежными окончаниями.
-    Например: «Витебске» → ['Витебске', 'Витебск'], «Москве» → ['Москве', 'Москв', 'Москва'].
+    «Витебске» → ['Витебске', 'Витебск'], «Москве» → ['Москве', 'Москв', 'Москва'].
     """
     variants = [word]
     wl = word.lower()
@@ -184,7 +192,6 @@ def word_variants(word: str):
         if wl.endswith(suffix) and len(wl) - len(suffix) >= 3:
             base = word[:-len(suffix)]
             variants.append(base)
-            # Для женских: «москв» → «москва», «гомел» → «гомель»
             if not base.endswith(("а", "я", "о", "е", "ь", "й", "у", "ю")):
                 variants.append(base + "а")
                 variants.append(base + "ь")
@@ -225,7 +232,6 @@ def extract_city_from_text(text: str, bot_username: str):
     if not words:
         return ""
 
-    # Собираем кандидатов: фразы (3, 2) и одиночные слова
     candidates = []
     for size in (3, 2, 1):
         for i in range(len(words) - size + 1):
@@ -243,17 +249,14 @@ def extract_city_from_text(text: str, bot_username: str):
 
             candidates.append(" ".join(phrase_words))
 
-            # Для одиночного слова — добавляем все варианты с обрезкой
             if size == 1:
                 candidates.extend(word_variants(phrase_words[0]))
             else:
-                # Для фраз — обрезаем только последнее слово
                 last_variants = word_variants(phrase_words[-1])
                 for lv in last_variants:
                     if lv != phrase_words[-1]:
                         candidates.append(" ".join(phrase_words[:-1] + [lv]))
 
-    # Убираем дубли
     seen = set()
     unique_candidates = []
     for c in candidates:
@@ -262,7 +265,6 @@ def extract_city_from_text(text: str, bot_username: str):
             seen.add(key)
             unique_candidates.append(c)
 
-    # Проверяем через API
     for candidate in unique_candidates:
         if len(candidate) < 3:
             continue
@@ -364,8 +366,22 @@ async def send_weather(
         return
 
     data = get_weather(lat, lon)
+
+    # Повторная попытка через 1 сек, если API не ответил
     if not data:
-        await message.answer("❌ Не удалось получить данные о погоде.")
+        await asyncio.sleep(1)
+        data = get_weather(lat, lon)
+
+    if not data:
+        text = (
+            f"❌ Не удалось получить данные о погоде для «{resolved}».\n"
+            "Попробуй ещё раз через пару секунд."
+        )
+        kb = None if is_group else back_kb()
+        kwargs = {}
+        if is_group and reply_to and GROUP_SETTINGS["reply_to_user"]:
+            kwargs["reply_to_message_id"] = reply_to.message_id
+        await message.answer(text, reply_markup=kb, **kwargs)
         return
 
     chat_last_city[message.chat.id] = resolved
@@ -389,7 +405,13 @@ async def show_weather_edit(message: Message, city: str):
         return
     data = get_weather(lat, lon)
     if not data:
-        await message.edit_text("❌ Не удалось получить погоду.", reply_markup=back_kb())
+        await asyncio.sleep(1)
+        data = get_weather(lat, lon)
+    if not data:
+        await message.edit_text(
+            "❌ Не удалось получить погоду. Попробуй ещё раз.",
+            reply_markup=back_kb(),
+        )
         return
     await message.edit_text(
         format_current_weather(resolved, data),
@@ -589,7 +611,13 @@ async def handle_text(message: Message):
             return
         data = get_weather(lat, lon)
         if not data:
-            await wait.edit_text("❌ Не удалось получить данные.")
+            await asyncio.sleep(1)
+            data = get_weather(lat, lon)
+        if not data:
+            await wait.edit_text(
+                "❌ Не удалось получить данные. Попробуй ещё раз.",
+                reply_markup=back_kb(),
+            )
             return
 
         chat_last_city[message.chat.id] = resolved
