@@ -42,20 +42,32 @@ TRIGGER_WORDS = [
 SKIP_WORDS = {
     # предлоги и союзы
     "в", "во", "на", "для", "по", "о", "об", "про", "с", "со", "из", "от", "до",
-    "и", "а", "но", "же", "ли", "бы", "не", "ни", "у", "к", "ко",
-    "for", "in", "at", "on", "the", "of", "to",
+    "и", "а", "но", "же", "ли", "бы", "не", "ни", "у", "к", "ко", "при", "над",
+    "под", "за", "без", "через", "между",
+    "for", "in", "at", "on", "the", "of", "to", "with", "and", "or",
     # вопросительные / вводные
-    "какая", "какой", "какое", "какие", "какую", "каком",
-    "покажи", "скажи", "подскажи", "узнай", "хочу", "можно", "надо",
+    "какая", "какой", "какое", "какие", "какую", "каком", "каких",
+    "покажи", "скажи", "подскажи", "узнай", "хочу", "можно", "надо", "дай",
     "сегодня", "завтра", "вчера", "сейчас", "будет", "была", "был", "были",
-    "пожалуйста", "плиз", "please",
-    # сам триггер (на всякий случай)
+    "пожалуйста", "плиз", "please", "давай", "давайте", "лучше",
+    "нужно", "хотел", "хотела", "хотелось",
+    # сам триггер
     "погода", "погодка", "погоду", "погоде", "погоды", "погодой",
     "метео", "метеосводка", "weather", "прогноз", "температура",
-    # мусор
-    "ну", "что", "эту", "этот", "эта", "эти", "там", "тут", "где",
-    "ебашь", "ебал", "ебать", "блядскую", "блядь", "блять", "хуй", "хуя",
-    "пиздец", "пидорас", "пизда", "сука", "нах", "нахуй",
+    # общие слова
+    "ну", "что", "эту", "этот", "эта", "эти", "там", "тут", "где", "когда",
+    "сделал", "сделай", "сделать", "показал", "показать", "покажешь",
+    "меню", "список", "кнопка", "кнопки", "кнопку",
+    "бот", "боте", "бота", "боту", "ботом",
+    # мат и ругань
+    "ебашь", "ебал", "ебать", "ебала", "ебет", "ебут",
+    "блядскую", "блядь", "блять", "бля", "блят",
+    "хуй", "хуя", "хую", "хуем", "хуе", "хуё",
+    "пиздец", "пизда", "пизды", "пизду",
+    "пидорас", "пидор", "пидр",
+    "сука", "суки", "суку", "сучка", "сучки",
+    "нах", "нахуй", "нахер", "нахрен",
+    "нет", "да", "бог", "боже", "господи",
 }
 
 POPULAR_CITIES = {
@@ -142,19 +154,46 @@ def decode_weather_code(code: int):
 
 # ==================== ПАРСИНГ ====================
 def normalize_city(word: str) -> str:
-    """
-    Грубо отсекает падежные окончания, чтобы Open-Meteo легче нашёл город.
-    «Москве» → «Москв», «Минске» → «Минск», «Париже» → «Париж».
-    """
+    """Грубо отсекает падежные окончания для лучшего поиска в API."""
     w = word.strip(" ?!.,:;()\"'—–-").lower()
     if not w or len(w) < 2:
         return ""
-
-    # Если уже именительный или неизвестный — оставим как есть
     for suffix in ("ой", "ей", "е", "у", "ю", "а", "я", "ы", "и"):
         if w.endswith(suffix) and len(w) - len(suffix) >= 3:
             return w[:-len(suffix)]
     return w
+
+
+def is_likely_city(word: str, position: int) -> bool:
+    """Эвристика: слово похоже на название города?"""
+    w = word.strip()
+    if len(w) < 3:
+        return False
+
+    wl = w.lower()
+
+    # Отсеиваем глагольные/наречные окончания
+    bad_suffixes = (
+        "ать", "ить", "уть", "ыть", "еть",
+        "ешь", "ишь", "ёшь",
+        "ал", "ил", "ел", "ул", "ыл",
+        "ла", "ло", "ли", "ле",
+        "но", "то", "же", "бы",
+        "ся", "сь",
+    )
+    for suf in bad_suffixes:
+        if wl.endswith(suf) and len(wl) - len(suf) >= 2:
+            return False
+
+    # С большой буквы — вероятно имя собственное
+    if w[0].isupper():
+        return True
+
+    # Слово в нижнем регистре в начале — вряд ли город
+    if position == 0:
+        return False
+
+    return True
 
 
 def extract_city_from_text(text: str, bot_username: str):
@@ -169,12 +208,10 @@ def extract_city_from_text(text: str, bot_username: str):
 
     original = text.strip()
 
-    # Убираем упоминание бота
     cleaned = re.sub(
         rf"@{re.escape(bot_username)}\b", " ", original, flags=re.IGNORECASE
     )
 
-    # Ищем триггер в любом месте
     lowered = cleaned.lower()
     trigger_found = any(word in lowered for word in TRIGGER_WORDS)
     if not trigger_found:
@@ -186,20 +223,32 @@ def extract_city_from_text(text: str, bot_username: str):
             rf"\b{re.escape(word)}\w*\b", " ", cleaned, flags=re.IGNORECASE
         )
 
-    # Чистим пунктуацию
     cleaned = re.sub(r"[?!.,:;()\"'—–\-]", " ", cleaned)
     words = [w for w in cleaned.split() if w]
+
+    if not words:
+        return ""
 
     # Собираем кандидатов: 3, 2, 1 слово
     candidates = []
     for size in (3, 2, 1):
         for i in range(len(words) - size + 1):
             phrase_words = words[i:i + size]
+
             if any(w.lower() in SKIP_WORDS for w in phrase_words):
                 continue
+
+            if size == 1:
+                w = phrase_words[0]
+                if not is_likely_city(w, i):
+                    continue
+            else:
+                if any(len(w) < 3 for w in phrase_words):
+                    continue
+
             candidates.append(" ".join(phrase_words))
 
-    # Добавляем варианты с нормализацией окончаний
+    # Нормализация окончаний
     extra = []
     for c in candidates:
         norm = " ".join(normalize_city(w) for w in c.split())
@@ -207,7 +256,7 @@ def extract_city_from_text(text: str, bot_username: str):
             extra.append(norm)
     candidates.extend(extra)
 
-    # Убираем дубли, сохраняя порядок
+    # Убираем дубли
     seen = set()
     unique_candidates = []
     for c in candidates:
@@ -217,11 +266,22 @@ def extract_city_from_text(text: str, bot_username: str):
 
     # Проверяем через API
     for candidate in unique_candidates:
+        if len(candidate) < 3:
+            continue
+        if candidate.islower() and len(candidate) < 4:
+            continue
+
         lat, lon, resolved = get_coordinates(candidate)
         if lat is not None and resolved:
+            # Защита: имя из API должно быть похоже на кандидата
+            if len(resolved) < 3:
+                continue
+            rl = resolved.lower()
+            cl = candidate.lower()
+            if not (rl.startswith(cl[:3]) or cl.startswith(rl[:3])):
+                continue
             return resolved
 
-    # Города нет — покажем меню
     return ""
 
 
